@@ -20,50 +20,30 @@ class PhysicsAttention(nn.Module):
         slice_logits = nn.Dense(self.num_slices)(x)  # [B, N, M]
         slice_weights = jax.nn.softmax(slice_logits, axis=-1)  # [B, N, M]
 
-        qkv = nn.Dense(3 * self.num_heads * self.dim_per_head)(x)  # [B, N, 3 * H * D]
+        slices = slice_weights[...,None] *  x[...,None, :] # [B, N, M, C]
+        # Step 2: Aggregate slices to tokens (z_j in the paper) using Eq. (2)
+        # z_j = sum(s_j) / sum(w_i,j)
+        token_numerator = jnp.sum(slices, axis=1) 
+        token_denominator = jnp.sum(slice_weights, axis=1,) 
+        # z = token_numerator / token_denominator
+        tokens = token_numerator / (token_denominator[...,None] + 1e-9)  # [B, M, C]
+        qkv = nn.Dense(3 * self.num_heads * self.dim_per_head)(tokens)  # [B, M, 3 * H * D]
         qkv = qkv.reshape(
-            batch_size, num_points, 3, self.num_heads, self.dim_per_head
-        )  # [B, N, 3, H, D]
-        qkv = jnp.transpose(qkv, (2, 0, 3, 1, 4))  # [3, B, H, N, D]
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each [B, H, N, D]
-
-        # Aggregating points to physics-aware tokens (Eq. 2)
-        # First reshape to [B, N, M, 1, 1]
-        slice_weights_expanded = slice_weights[..., None, None]
-        # Then transpose to [B, 1, M, N, 1] to align with head dimension
-        slice_weights_for_qkv = jnp.transpose(
-            slice_weights_expanded, (0, 3, 2, 1, 4)
-        )  # [B, 1, M, N, 1]
-        weight_sums = jnp.sum(
-            slice_weights_for_qkv, axis=3, keepdims=True
-        )  # [B, 1, M, 1, 1]
-        weight_sums = weight_sums.reshape(
-            batch_size, 1, self.num_slices, 1
-        )  # [B, 1, M, 1]
-
-        q_sliced = jnp.sum(q[:, :, None, :, :] * slice_weights_for_qkv, axis=3)
-        k_sliced = jnp.sum(k[:, :, None, :, :] * slice_weights_for_qkv, axis=3)
-        v_sliced = jnp.sum(v[:, :, None, :, :] * slice_weights_for_qkv, axis=3)
-
-        # Normalize by the sum of slice weights
-        q_sliced = q_sliced / (
-            weight_sums.reshape(batch_size, 1, self.num_slices, 1) + 1e-9
+            batch_size, self.num_slices, 3, self.num_heads, self.dim_per_head
         )
-        k_sliced = k_sliced / (
-            weight_sums.reshape(batch_size, 1, self.num_slices, 1) + 1e-9
-        )
-        v_sliced = v_sliced / (
-            weight_sums.reshape(batch_size, 1, self.num_slices, 1) + 1e-9
-        )
+        qkv = jnp.transpose(qkv, (2, 0, 3, 1, 4))  # [3, B, H, M, D]
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each [B, H, M, D]
+
 
         scale = jnp.sqrt(self.dim_per_head)
-        attention = jnp.matmul(q_sliced, jnp.transpose(k_sliced, (0, 1, 3, 2))) / scale
+        attention = jnp.matmul(q, jnp.transpose(k, (0, 1, 3, 2))) / scale
         attention = jax.nn.softmax(attention, axis=-1)  # [B, H, M, M]
 
-        token_output = jnp.matmul(attention, v_sliced)  # [B, H, M, D]
-        token_output = jnp.transpose(token_output, (0, 2, 1, 3))[:, None, ...]
+        token_output = jnp.matmul(attention, v)  # [B, H, M, D]
+        token_output = jnp.transpose(token_output, (0, 2, 1, 3))
+        slice_weights = jnp.transpose(slice_weights, (0, 2, 1))
+        output = jnp.sum(token_output[:,:,None,...] * slice_weights[...,None, None], axis=1)  # [B, N, H, D]
 
-        output = jnp.sum(token_output * slice_weights_expanded, axis=2)  # [B, N, H, D]
         output = output.reshape(
             batch_size, num_points, self.num_heads * self.dim_per_head
         )
@@ -136,3 +116,43 @@ class Transolver(nn.Module):
         
         # Output projection
         return nn.Dense(self.output_dim)(x)
+
+        
+# class TransolverSummarizer(nn.Module):
+#     """Transolver model for point clouds."""
+#     num_layers: int
+#     num_slices: int
+#     num_heads: int
+#     hidden_dim: int
+#     num_channels: int
+#     mlp_dim: int
+#     output_dim: int
+#     dropout_rate: float = 0.0
+#     aggregation: str = "mean"
+    
+#     # Three options:
+#     # 1. aggregate at point level
+#     # 2. aggregate at slice level
+#     # 3. have global token
+
+#     @nn.compact
+#     def __call__(self, x, train: bool = True):
+
+#         x = Transolver(
+#             num_layers=self.num_layers,
+#             num_slices=self.num_slices,
+#             num_heads=self.num_heads,
+#             hidden_dim=self.hidden_dim,
+#             num_channels=self.num_channels,
+#             mlp_dim=self.mlp_dim,
+#             output_dim=self.output_dim,
+#             dropout_rate=self.dropout_rate
+#         )(x, train=train,)
+#         if self.aggregation == "mean":
+#             return jnp.mean(x, axis=1)
+#         elif self.aggregation == "max":
+#             return jnp.max(x, axis=1)
+#         elif self.aggregation == "attention":
+
+#         else:
+#             raise ValueError(f"Invalid aggregation method: {self.aggregation}")
