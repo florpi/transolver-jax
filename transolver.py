@@ -104,3 +104,35 @@ class TransolverBlock(nn.Module):
 
         # Residual connection
         return x + y
+
+class Transolver(nn.Module):
+    """Transolver model for point clouds."""
+    num_layers: int
+    num_slices: int
+    num_heads: int
+    hidden_dim: int
+    num_channels: int
+    mlp_dim: int
+    output_dim: int
+    dropout_rate: float = 0.0
+    
+    @nn.compact
+    def __call__(self, x, train: bool = True):
+        
+        # Initial embedding
+           
+        x = nn.Dense(self.hidden_dim)(x)
+        
+        # Transolver blocks
+        for _ in range(self.num_layers):
+            x = TransolverBlock(
+                num_slices=self.num_slices,
+                num_heads=self.num_heads,
+                dim_per_head=self.hidden_dim // self.num_heads,
+                mlp_dim=self.mlp_dim,
+                num_channels=self.num_channels,
+                dropout_rate=self.dropout_rate
+            )(x, train=train)
+        
+        # Output projection
+        return nn.Dense(self.output_dim)(x)
